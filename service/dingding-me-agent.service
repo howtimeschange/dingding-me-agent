@@ -1,0 +1,15 @@
+[Unit]
+Description=Dingding Me Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/ABS/PATH/TO/dingding-me-agent
+EnvironmentFile=%h/.config/dingding-me-agent/env
+ExecStart=/ABS/PATH/TO/dingding-me-agent/.venv/bin/dingding-me-agent --config %h/.dingding-me-agent/config.json --print-command
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

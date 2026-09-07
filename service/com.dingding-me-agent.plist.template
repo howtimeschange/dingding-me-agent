@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dingding-me-agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABS/PATH/TO/dingding-me-agent/.venv/bin/dingding-me-agent</string>
+    <string>--config</string>
+    <string>/ABS/PATH/TO/config.json</string>
+    <string>--print-command</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>WorkingDirectory</key>
+  <string>/ABS/PATH/TO/dingding-me-agent</string>
+  <key>StandardOutPath</key>
+  <string>/ABS/PATH/TO/dingding-me-agent.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/ABS/PATH/TO/dingding-me-agent.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>DINGDING_ME_AGENT_HOME</key>
+    <string>/ABS/PATH/TO/state</string>
+  </dict>
+</dict>
+</plist>
