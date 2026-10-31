@@ -1,458 +1,140 @@
-# Dingding Me Agent 产品经理型个人代理 Spec
+# Dingding Me Agent 0.2.0 当前架构与边界
 
-## 1. 目标
+本文描述 0.2.0 的本地实现契约，验收项是检查要求，不代表已完成真实群消息、生产服务
+或发布验收。安装和字段说明见 [README](../README.md)，运行细节见
+[Worker guide](worker.md)，中断处理见 [恢复说明](runtime-recovery.md)。
 
-构建一个和 Codex 连接的钉钉个人代理。它持续监听白名单项目群，读取用户反馈，先做产品经理式分流，再决定是直接对话回复、追问补充信息、进入需求评审，还是交给 Codex 做代码评估、修复、测试和交付回群。
+## 目标与实体
 
-它不是普通自动回复机器人，也不是监听到消息就改代码的脚本。所有外部消息、代码动作、测试证据和交付回复都必须被状态机记录，并且受白名单、模式、风险和验证门禁控制。
+服务以 DWS 当前个人用户接收白名单群消息，完成咨询回复、反馈分类、代码评审和
+受控本地修改。DWS 负责认证、事件连接、历史读取和消息发送；Codex CLI 负责群会话
+及代码子任务。服务不自动提交、推送、合并或发布。
 
-核心场景：
+| 实体 | 当前载体 | 含义 |
+| --- | --- | --- |
+| GroupConfig | 配置 JSON / Python dataclass | 群、项目、仓库、owner、模式和发送/执行策略 |
+| Job | SQLite `jobs` | 已接收事件、profile/会话 lane、处理路由和授权快照 |
+| Step | SQLite `steps` | 一个已开始或完成的处理步骤及其结果 |
+| Outbox | SQLite `outbox` | 普通回复的固定 UUID、目标、正文、策略和投递结果 |
+| ClassificationResult | 结构化分类 / task bundle | 类型、置信度、代码需求、风险和验收要求 |
+| Pending approval | 每群 JSON 中按任务 ID 保存 | 多个待 owner 确认请求及原始授权范围 |
+| Codex session | 每群 `session.json` 和日志 | thread ID 与 Codex 会话上下文 |
+| Code task | 任务目录 / worktree / 结果 JSON | 本地代码执行、验证输出和待发布结果 |
 
-- 监听多个项目群：抓虾、Listingify、深绘 AI 上新等。
-- 读到反馈后分类：咨询、操作问题、需求、疑似 BUG、明确 BUG、运维/权限/发布、噪声。
-- 能通过对话解决的，直接在群里回复。
-- 需要代码判断的，自动进入 Codex 评审/实现流程。
-- Codex 先评估改动面，必要时回群追问或转人工确认。
-- 确认是 BUG 且风险可控时，自动修改、跑测试、输出证据。
-- 完成后回群交付：修了什么、验证了什么、是否已发布或待发布。
+Job 不是完整工单产品；没有独立的 Ticket/Assignment 生命周期、跨群订阅图或每任务
+持久 Codex session。群连续对话仍以 conversation ID 关联 Codex thread。
 
-## 2. 总体架构
-
-```mermaid
-flowchart LR
-  A["DWS Event Listener"] --> B["Intake Classifier"]
-  B --> S["Group Codex Session"]
-  S --> C{"needs_code?"}
-  C -- "no" --> D["Dialogue Reply"]
-  C -- "yes" --> E["Codex Bridge / Read-only Review"]
-  E --> F["Change Scope Review"]
-  F --> G{"safe autofix?"}
-  G -- "no" --> H["Ask / Human Gate"]
-  G -- "yes" --> I["Codex Fix + Tests"]
-  H --> J["Delivery Reporter"]
-  I --> J
-  D --> J
-  J --> K["DWS Group Reply"]
-```
-
-### 2.1 DWS Event Listener
-
-事实来源只使用 DWS 个人 IM 事件长连接，不轮询历史消息：
-
-```bash
-dws event consume user_im_message_receive_group \
-  --group <openConversationId> \
-  --flatten \
-  -f ndjson
-```
-
-监听规则：
-
-- 配置里一个启用群对应一个 `dws event consume` 子进程。
-- 每个子进程只订阅一个 `openConversationId`。
-- 启动后等待 stderr 中的 `[event] ready ...`，再认定监听可用。
-- 即使 DWS 已按 `--group` 过滤，worker 仍会再次检查事件里的 `conversation_id` 是否在准入集合里。
-- 非白名单群消息在任何 AI 调用、Codex 调用和回复发送前丢弃。
-- 每条事件通过 `event_id` / `message_id` / 内容哈希做本地去重。
-
-### 2.2 Intake Classifier
-
-分类器把群消息归一为结构化反馈：
-
-```json
-{
-  "project": "crawshrimp|listingify|deepdraw|winyai",
-  "type": "question|support|feature|suspected_bug|bug|ops|noise",
-  "confidence": 0.87,
-  "needs_code": true,
-  "risk": "low|medium|high",
-  "reply_draft": "收到，按 BUG 反馈进入排查，我会先评估改动面和验证路径。",
-  "codex_task": {
-    "repo": "/ABS/PATH/TO/crawshrimp",
-    "goal": "复现并修复用户反馈的明确 BUG，完成测试并给出交付说明。",
-    "evidence": [
-      "ding_event:<event_id>",
-      "ding_message:<message_id>",
-      "ding_conversation:<openConversationId>"
-    ],
-    "acceptance": [
-      "确认根因",
-      "实现低风险修复",
-      "运行配置的测试命令",
-      "输出交付说明和待发布状态"
-    ],
-    "test_commands": ["python3 -m pytest"]
-  }
-}
-```
-
-分类语义：
-
-| 中文类型 | `type` | 默认动作 |
-|---|---|---|
-| 咨询 | `question` | 直接对话回复 |
-| 操作问题 | `support` | 直接给操作路径；必要时追问 |
-| 需求 | `feature` | 进入需求评审，默认不自动改代码 |
-| 疑似 BUG | `suspected_bug` | 先复现/定位；信息不足则追问 |
-| 明确 BUG | `bug` | 评估改动面；低风险可自动修复 |
-| 运维/权限/发布 | `ops` | 高风险优先，转人工确认 |
-| 噪声 | `noise` | 不回复、不进 Codex |
-
-### 2.3 Codex Bridge
-
-每个群可以配置 `reply_engine=codex`。启用后，worker 会为每个群维护一个长期 Codex session；普通回复、追问、进度回答和允许范围内的本地只读探查都通过这个 session 完成。DWS 只负责监听和发送，回复正文由 Codex session 输出。
-
-Codex session 状态：
-
-```text
-~/.dingding-me-agent/codex-sessions/<conversation_id>/
-  session.json
-  <event_id>.prompt.md
-  <event_id>.codex.jsonl
-  <event_id>.codex.err.log
-  last_message.md
-```
-
-当 `needs_code=true` 且需要单独评审记录时，worker 也会生成 Codex task bundle：
-
-```text
-~/.dingding-me-agent/codex-tasks/<task_id>/
-  event.json
-  classification.json
-  prompt.md
-  codex.jsonl
-  codex.err.log
-  last_message.md
-  status.json
-```
-
-Codex Bridge 的职责：
-
-- 把群消息、项目、仓库路径、分类结果、验收标准和测试命令写入 task bundle。
-- 在 `guarded` 模式下，用 `codex exec --sandbox read-only` 做评审，不允许改文件。
-- 在 `autofix` 模式下，只有通过门禁才用 `codex exec --sandbox workspace-write`。
-- Codex prompt 强制先输出改动面评估，再决定 `NEEDS_INFO`、`BLOCKED` 或 `FIXED`。
-- 监听进程本身不直接编辑项目仓库；代码动作只发生在 Codex 子任务中。
-
-### 2.4 Delivery Reporter
-
-Delivery Reporter 把状态机结果转成群里能理解的话：
-
-- 已收到，正在判断。
-- 这个需要补充信息：缺少复现步骤/截图/账号环境/具体商品。
-- 已进入 Codex 评审，正在评估改动面和验证路径。
-- 已确认为 BUG，开始修复。
-- 已修复，验证通过：列出测试命令和结果。
-- 已本地完成，待发布/待合并。
-- 无法自动处理：说明风险、缺少 repo、缺少测试命令或需要人工确认。
-
-交付消息不能声称已发布，除非有真实发布或读回证据。
-
-## 3. 状态机
+## 数据流
 
 ```mermaid
-stateDiagram-v2
-  [*] --> received
-  received --> ignored: not allowlisted / duplicate / noise
-  received --> admitted: group allowlist matched
-  admitted --> classified
-  classified --> dialogue_reply: question/support and no code
-  dialogue_reply --> delivered: send enabled
-  dialogue_reply --> drafted: send disabled
-  classified --> review_planned: feature/suspected_bug/bug needs code
-  review_planned --> needs_human: missing repo/tests/info or high risk
-  review_planned --> codex_review: guarded
-  review_planned --> codex_autofix: autofix gates passed
-  codex_review --> needs_human: change requires confirmation
-  codex_review --> delivered: assessment or follow-up sent
-  codex_autofix --> fixed: Codex modified code
-  fixed --> verified: configured tests pass
-  verified --> delivered: delivery message sent
-  needs_human --> delivered: ask / blocked reason sent
-  drafted --> [*]
-  delivered --> [*]
-  ignored --> [*]
+flowchart TD
+  D[DWS 个人 IM 事件] --> A[事件类型和群准入]
+  A --> I[(SQLite inbox + 授权快照)]
+  I --> Q[有界调度: 同会话串行]
+  Q --> C[历史上下文与反馈分类检查点]
+  C --> O[observe / noise: 记录后停止]
+  C --> S[群级 Codex 或 AI 回复]
+  C --> B[代码评审 / autofix / owner 审批]
+  B --> W[写任务: 独立 worktree]
+  W --> V[宿主测试 + 本地成果]
+  S --> X[(回复 outbox)]
+  V --> X
+  X --> R[DWS 发回允许目标]
 ```
 
-不变量：
+每个启用群按 trigger 建立 listener；mention + approval 另建仅处理确认的群 listener。
+入口仍是 `dws event consume --flatten -f ndjson`，不轮询历史替代事件流。
 
-- `received -> admitted` 必须命中群白名单。
-- `classified -> dialogue_reply` 必须满足 `needs_code=false`。
-- `review_planned -> codex_autofix` 必须满足低风险、明确 BUG、高置信、repo 可用、测试命令存在、显式开启 `codex_execute`。
-- `fixed -> verified` 必须有当前轮测试证据。
-- `verified -> delivered` 不能把“本地已修复”说成“线上已发布”。
+SQLite 对同一 profile/会话中的重复消息做持久去重；旧 `seen.jsonl` 继续参与过滤。
+默认 3 个 worker，可通过 `--max-workers 1–32` 调整；一个 lane 不会同时执行两条事件。
+短入库操作后释放 intake 锁，模型、代码和测试运行在调度线程中。
 
-## 4. 自动化模式
+## 准入、授权与模式
 
-| 模式 | 读群 | 分类 | 发普通对话 | 创建 Codex task bundle | 启动 Codex | 改代码 |
-|---|---:|---:|---:|---:|---:|---:|
-| `observe` | yes | yes | no | no | no | no |
-| `draft` | yes | yes | no | yes, only draft | no | no |
-| `guarded` | yes | yes | yes, if `send=true` | yes | yes, review-only | no |
-| `autofix` | yes | yes | yes, if `send=true` | yes | yes | only gated low-risk BUG |
+群准入、目标允许范围与 owner 身份由本地配置授予，消息正文、历史和模型输出不能
+扩大发送或仓库授权。排队任务保存授权快照，执行前对比当前注册策略；变化后 blocked。
+这不是对所有运行中子进程的即时撤权协议，也不自动取消已开始的外部动作。
 
-默认模式是 `draft`。历史兼容的 `send` 会被视为 `guarded + send=true`。
+| 路径 | 行为 |
+| --- | --- |
+| `observe` | 分类后结束，不生成回复、不启动 Codex；分类器本身可以调用 AI |
+| `draft` | 生成本地草稿或任务材料；`reply_engine=codex` 会启动/恢复群 session |
+| `guarded` 一般代码桥接 | 需要 `codex_execute=true` 和可用 repo，请求只读评审 |
+| `autofix` 一般代码桥接 | `code_write_policy=auto`、执行 flag、明确 BUG、低风险、置信度达标、repo、测试命令同时满足后运行可写任务 |
+| owner 确认代码任务 | approval policy、owner、明确请求、授权范围及执行 flag 必须匹配；不额外要求 autofix 模式 |
 
-## 5. 自动修复门禁
+`send=false` 禁止普通回复实际发送，但不代表禁止本地模型调用。要关闭写代码能力，
+使用 `code_write_policy=none` 或 `codex_execute=false`，不要只依赖 guarded 名称。
+默认 `none` 同样阻止普通 autofix；`approval` 对 AI/Codex 两种回复引擎都先保存
+pending 再等待 owner 确认，不因 autofix 模式而直接执行。
 
-真正自动改代码必须同时满足：
+## 代码执行与验证
 
-- 群已白名单。
-- 项目已配置 `project` 和 `repo`。
-- `mode=autofix`。
-- `codex_execute=true`。
-- 分类为 `bug`，不是 `feature` 或 `suspected_bug`。
-- 分类置信度大于等于 `autofix_min_confidence`，默认 `0.85`。
-- `risk=low`。
-- repo 路径存在且可访问。
-- 至少配置一条测试命令。
-- 消息不涉及权限、支付、生产配置、数据删除、发布开关、凭证等高风险动作。
+群回复新 session 和 resume 显式请求 Codex `read-only`；批准的代码任务及通过门禁的
+普通 autofix 请求 `workspace-write`，在独立 Git worktree 中执行。
 
-任一条件不满足，则转为 `blocked` 或 `needs_human`，只回群说明需要补充信息或人工确认。
+可写任务的 Codex 成功返回后，宿主在工作树运行配置的测试，并保存每条命令的
+返回码、耗时、stdout/stderr 路径和 `verification.json`。测试失败使任务失败。
+普通 autofix 必须有测试命令；批准任务若未配置测试，只能报告未完成测试验证。
+Codex 退出零和模型自报 FIXED 都不等于线上验收。
 
-## 6. 配置契约
+宿主通过 shell 运行测试，不在 Codex sandbox 内。工作树和 CLI sandbox 参数不能
+推广成全部工具、网络、绝对路径或测试命令都被本项目强隔离的保证。
 
-运行配置默认放在 git 外：
+## 多请求审批
 
-```text
-~/.dingding-me-agent/config.json
-```
+每群 JSON 文件使用 version 2 的 pending map，兼容读取旧版单请求文件。请求 ID 为
+`dws-codex-` 加 20 位哈希。owner 可回复 `确认 dws-codex-0123456789abcdef0123`。
+无 ID 的确认只在恰有一个请求时执行；多个请求先要求选择。
+正文须由完整配置确认词组成，可接受 `好的，继续`，拒绝 `不确认`、
+`确认一下原因` 等否定或追问。
 
-完整示例：
+恢复不延长原 TTL，也不覆盖原授权。首次开始执行前检查过期；已有执行检查点时，
+完成结果可继续用于交付，未知结果继续阻止重跑。后续确认不产生新的任务执行与
+投递身份。普通回复先记 outbox，再调用 DWS，交付返回后才清除对应 pending。
 
-```json
-{
-  "defaults": {
-    "mode": "draft",
-    "profile": "",
-    "query": "问题,反馈,bug,报错,不能用,需求",
-    "reply_target": "auto",
-    "ready_message": "",
-    "send": false,
-    "reply_engine": "codex",
-    "reply_skill": "laoxing",
-    "reply_skill_path": "~/.codex/skills/laoxing/SKILL.md",
-    "codex_audit_session_dir": "~/Documents/ChatGPT/钉钉分身会话",
-    "classifier": "heuristic",
-    "codex_execute": false
-  },
-  "groups": [
-    {
-      "name": "赢在AI",
-      "group": "<openConversationId>",
-      "project": "winyai",
-      "repo": "",
-      "mode": "draft",
-      "ready_message": "我在了",
-      "enabled": true
-    },
-    {
-      "name": "抓虾反馈群",
-      "group": "<openConversationId>",
-      "project": "crawshrimp",
-      "repo": "/ABS/PATH/TO/crawshrimp",
-      "mode": "guarded",
-      "reply_engine": "codex",
-      "code_keywords": ["抓虾", "crawshrimp"],
-      "query": "抓虾,AI视频,生图,鞋包,报错,不能用,需求",
-      "test_commands": ["python3 -m pytest"],
-      "enabled": true
-    },
-    {
-      "name": "Listingify / SHEIN API 测试群",
-      "group": "<openConversationId>",
-      "project": "listingify",
-      "repo": "/ABS/PATH/TO/Listingify",
-      "mode": "guarded",
-      "query": "SHEIN,上新,草稿,发布,类目,尺码,报错,需求",
-      "test_commands": ["npm test"],
-      "enabled": true
-    },
-    {
-      "name": "深绘 AI 上新反馈群",
-      "group": "<openConversationId>",
-      "project": "deepdraw",
-      "repo": "/ABS/PATH/TO/Listingify",
-      "mode": "guarded",
-      "query": "深绘,AI上新,建档,尺码表,图片,类目,报错,需求",
-      "test_commands": ["npm test"],
-      "enabled": true
-    }
-  ]
-}
-```
+## 中断语义
 
-配置检查：
+SQLite 数据库使用 WAL、FULL 同步和 `0600` 文件权限。数据库路径默认为
+`Path(state_file).with_suffix(".sqlite3")`，支持 `--runtime-db`。进程持有该数据库
+旁的锁；不同数据库之间没有共享锁或去重保证。
 
-```bash
-dingding-me-agent \
-  --config ~/.dingding-me-agent/config.json \
-  --config-check
-```
+| 中断前状态 | 下次正常启动的处理 |
+| --- | --- |
+| job `running` | 回到 `queued`，重新核对路由和策略 |
+| step `completed` | 复用已保存结果 |
+| step `started` | 变为 `unknown`；再次触及时停止任务、等待人工回查 |
+| outbox `sent` | 复用已确认发送结果 |
+| outbox `sending` | 变为 `unknown`，禁止自动重发 |
+| queued job 策略变化 / 路由消失 | blocked，不沿旧授权继续执行 |
 
-启动监听：
+运行中发送超时、非成功退出或无有效回执也可能产生 unknown。job 通常记录为 failed
+并输出 attention 日志；step/outbox 的 unknown 是独立状态，不能由 job 计数推断。
+没有恢复 CLI 或自动权威对账。重启恢复排队任务不等于允许重放未知副作用。
 
-```bash
-dingding-me-agent \
-  --config ~/.dingding-me-agent/config.json \
-  --print-command
-```
+停止时保留队列，不继续启动积压任务；运行中的任务可在进程等待期间结束。强制
+退出后由上述检查点阻止未知动作自动重放。可选 ready 招呼通过单独检查点保护，
+失败或未知只记 attention，不阻塞收件箱启动。
 
-## 7. DWS 命令边界
+## 本地验收要求
 
-监听只用：
+- 白名单外消息不进入 AI/Codex/发送；不同 listener 的重复消息不重复入库。
+- 不同会话可并发，同一 lane 串行，停止保留未执行队列。
+- 重启复用 completed，不自动执行 unknown；排队策略变化 blocked。
+- 同群多个请求不互相覆盖，owner/任务 ID/授权范围和 TTL 正确约束执行。
+- 普通 autofix 和批准写任务都在独立 worktree；配置测试失败不能报告验证通过。
+- unknown 消息不通过重启或重复确认自动重发；ready 未知不阻塞 inbox 启动。
+- `make check`、`make config-check`、`git diff --check` 通过。
 
-```bash
-dws event consume user_im_message_receive_group --group <cid> --flatten -f ndjson
-```
+服务安装、fresh listener、真实消息投递、模型供应方、真实代码成果和生产发布
+仍需各自的实际证据；上述本地检查不能替代它们。
 
-回复只用：
+## 参考与后续边界
 
-```bash
-dws chat message send \
-  --group <cid> \
-  --text "<message>" \
-  --uuid "<stable uuid>" \
-  --format json
-```
+设计参考 DeepSeek 官方 [dsh-superagent-prototype](https://github.com/deepseek-ai/dsh-superagent-prototype)
+的持久状态、有界 worker 和 outbox。该仓库是研究原型。这里继续保留 Python/DWS/Codex
+CLI 与原 owner 门禁，没有迁入其 DSH 执行器、完整 Ticket/Assignment/订阅关系、
+GitHub PR 生命周期或 Web 面板。
 
-所有 DWS 命令必须带 `--format json` 或事件流 `-f ndjson`。禁止通过 curl、浏览器、未验证 API 或消息历史轮询替代 DWS 事件长连接。
-
-## 8. Codex 子任务契约
-
-Codex prompt 必须包含：
-
-- 原始群消息。
-- 项目和 repo。
-- 分类 JSON。
-- 群消息证据引用。
-- 验收标准。
-- 测试命令。
-- 当前自动化模式。
-- 明确的高风险停止规则。
-
-Codex 输出约定：
-
-- `NEEDS_INFO:` 信息不足，需要回群追问。
-- `BLOCKED:` 风险、权限、测试路径或 repo 缺口导致无法自动处理。
-- `FIXED:` 已修复并验证；必须说明改了什么、跑了哪些测试、发布状态。
-
-在 `guarded` 模式下，Codex 只能评审和定位，不能修改文件。在 `autofix` 模式下，Codex 仍必须先评估改动面；如果评估后风险升高，必须停止。
-
-## 9. 交付话术模板
-
-收到类：
-
-```text
-收到，按 BUG 反馈进入排查，我会先评估改动面和验证路径。
-```
-
-追问类：
-
-```text
-这个需要补充信息：请发一下复现步骤、截图和发生问题的商品/任务编号。
-```
-
-需求评审类：
-
-```text
-已进入需求评审。我先评估影响模块、验收标准和是否需要排期；不会直接改线上逻辑。
-```
-
-修复完成类：
-
-```text
-已完成本地修复：修了 <summary>。验证：<commands/results>。当前状态：待发布/待合并。
-```
-
-阻断类：
-
-```text
-这条不能自动处理：涉及 <risk/reason>，需要人工确认后继续。
-```
-
-## 10. 可观测性和审计
-
-worker stdout 输出一行一个 JSON：
-
-- `consume_command`
-- `classified`
-- `draft`
-- `sent`
-- `codex_draft`
-- `codex_planned`
-- `codex_blocked`
-- `codex_completed`
-- `codex_failed`
-- `ready_message_sent`
-- `skipped`
-
-必须记录：
-
-- `event_id`
-- `message_id`
-- `conversation_id`
-- `project`
-- `classification`
-- `task_id`
-- `task_dir`
-- `send_result`
-
-不得记录：
-
-- token、验证码、密码、身份证、银行卡、支付凭证。
-- 群内敏感附件原文。
-- 生产配置密钥。
-
-## 11. 验收标准
-
-完整工作流验收：
-
-- 能通过配置监听多个项目群。
-- 非白名单群消息不会触发 AI、Codex 或回复。
-- 咨询/操作问题能形成回复草稿或按配置发送。
-- 需求/疑似 BUG/明确 BUG 能形成 Codex task bundle。
-- `guarded` 只做 Codex 评审，不改文件。
-- `autofix` 只在低风险明确 BUG 且测试命令存在时启动可写 Codex。
-- 高风险、缺 repo、缺测试命令、信息不足会转人工确认。
-- Codex 完成后能生成回群交付文案，区分本地完成、待发布、已发布。
-- ready marker 场景中，第一期开白群 `赢在AI` 成功收到 `我在了`。
-
-工程验收：
-
-- `make check`
-- `make config-check`
-- `git diff --check`
-
-## 12. Rollout
-
-第一步连接验证：
-
-- 查询并确认 `赢在AI` 的 `openConversationId`。
-- 写入本地运行配置。
-- 启动监听。
-- 监听 ready 后在群里回复 `我在了`。
-
-第二步多群 observe/draft：
-
-- 加入抓虾、Listingify、深绘 AI 上新群配置。
-- `mode=observe` 跑 1-2 天，校验分类日志。
-- 切到 `mode=draft`，只产出回复和 Codex prompt，不发送。
-
-第三步 guarded：
-
-- 对咨询/操作问题允许 `send=true`。
-- 代码类反馈进入 Codex read-only 评审。
-- 需求和疑似 BUG 只输出追问、改动面和验收标准。
-
-第四步 autofix：
-
-- 只给低风险项目开启。
-- 必须配置 repo 和测试命令。
-- 只允许明确 BUG 自动修复。
-- 修复后默认回群说明本地完成和待发布，不自动发布。
-
-第五步发布/合并闭环：
-
-- 发布、合并、打 tag、推送、生产配置变更仍是独立高风险动作。
-- 只有当项目另行配置发布证据读取，并且获得明确授权，Delivery Reporter 才能说“已发布”。
+后续可独立设计人工对账/恢复命令、任务专属 session、追问归属和工作面板。当前
+不将这些规划算作已实现功能，也不声明所有外部动作只发生一次。

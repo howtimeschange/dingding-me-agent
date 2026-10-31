@@ -1,8 +1,11 @@
 # Dingding Me Agent
 
+当前版本：0.2.0（2026-11-01）。
+
 `dingding-me-agent` 是一个常驻的钉钉个人消息 Agent。它通过本机已登录的
 `dws` 接收群消息、可选读取近期上下文并发送回复；它可以维护每个群独立的
-Codex 会话，在严格门禁下创建 Git worktree、运行本地验证。
+Codex 会话，在严格门禁下创建 Git worktree、运行本地验证。0.2.0 增加 SQLite
+收件箱、执行检查点与回复 outbox；默认最多并行处理 3 个不同会话，同一会话串行。
 
 它适合“让一个人账号在白名单项目群里持续响应”的场景。它**不是** DWS
 stdio/MCP 插件，也**不是**钉钉机器人的 `dws dev connect` 替代品：本项目以
@@ -14,11 +17,13 @@ stdio/MCP 插件，也**不是**钉钉机器人的 `dws dev connect` 替代品�
 ```mermaid
 flowchart LR
   G["白名单钉钉群消息"] --> D["DWS event consume\n个人 IM 事件流"]
-  D --> A["Dingding Me Agent\n准入、去重、分类、策略"]
+  D --> I["SQLite Inbox\n准入、去重、授权快照"]
+  I --> A["有界调度\n同会话串行、跨会话并发"]
   A -->|"可选"| H["DWS chat message list\n历史上下文"]
   A -->|"回复引擎=Codex"| C["每群一个 Codex session"]
   A -->|"代码任务且门禁通过"| W["独立 Git worktree\nCodex + 本地测试"]
-  A --> O["DWS chat message send\n回到允许的目标"]
+  A --> Q["检查点 + 回复 Outbox"]
+  Q --> O["DWS chat message send\n回到允许的目标"]
 ```
 
 | 本项目负责 | DWS 负责 | 不会自动做 |
@@ -126,7 +131,7 @@ dingding-me-agent --config ~/.dingding-me-agent/config.json --print-command
 | 生成草稿 | `mode=draft`, `send=false` | 不发送回复；AI 引擎产生草稿。若回复引擎是 Codex，仍会启动/恢复会话来生成草稿。 |
 | 群内对话 | `mode=guarded`, `send=true` | 对允许目标发送回复；代码任务默认只建任务/做受限评审。 |
 | 只读代码评审 | `mode=guarded`, `codex_execute=true`, 配置 `repo` | 通用代码评审使用 `codex exec --sandbox read-only`。 |
-| 自动修复候选 | `mode=autofix`, `codex_execute=true`，低风险明确 BUG、可用 repo、测试命令齐全 | 代码桥接的 `autofix` 门禁通过后才允许 `workspace-write`。仍不提交、推送或发布。 |
+| 自动修复候选 | `mode=autofix`, `codex_execute=true`, `code_write_policy=auto`，低风险明确 BUG、可用 repo、测试命令齐全 | 代码桥接的全部门禁通过后才允许 `workspace-write`，并在独立 worktree 运行和验证。 |
 
 不要把 `--allow-any-target` 作为常态配置；白名单群应通过 `group`、
 `allow_conversation` 或配置文件内的群作用域精确限制。
@@ -151,9 +156,9 @@ dingding-me-agent --config ~/.dingding-me-agent/config.json --print-command
 | `reply_skill` / `reply_skill_path` | 本地 Codex Skill | 可选。填写后必须是当前机器真实存在的 `SKILL.md` 或目录。 |
 | `codex_audit_session_dir` | 可读审计镜像 | 可选；其中含群消息上下文，应使用私有目录。 |
 | `codex_execute` | 是否允许代码评审/已批准的代码任务实际启动 Codex | 默认 `false`。开启前必须同时复核仓库、模式、审批策略和测试命令。 |
-| `code_write_policy` | `none`、`approval`、`auto` | 常规建议 `none` 或 `approval`；`approval` 必须配置审批人。 |
+| `code_write_policy` | `none`、`approval`、`auto` | 默认 `none` 禁止写；`approval` 先建待审批请求且必须配置审批人；普通 autofix 还需显式 `auto`。 |
 | `approval_senders` | 可确认写代码的用户 ID 列表 | `approval` 且为空时会失败关闭，确认词不会触发修改。 |
-| `approval_phrases` / `approval_ttl_minutes` | 确认词与待审批过期时间 | 默认确认词为 `OK/好的/继续/确认/可以`，只应授予指定 owner。 |
+| `approval_phrases` / `approval_ttl_minutes` | 确认词与待审批过期时间 | 默认确认词为 `OK/好的/继续/确认/可以`；多任务请回复 `确认 dws-codex-<20位哈希>`，只应授予指定 owner。 |
 | `test_commands` | worktree 内的验证命令 | `autofix` 必需；命令在新建的独立 worktree 中运行。 |
 
 ### `mention`、审批与 listener 数量
@@ -165,6 +170,15 @@ dingding-me-agent --config ~/.dingding-me-agent/config.json --print-command
   `user_im_message_receive_group` listener，仅用于捕获 owner 的确认词；它不会把普通
   群消息当作常规回复请求。
 
+每群可以保留多个待审批请求。回复中的任务 ID 对应具体请求，例如
+`确认 dws-codex-0123456789abcdef0123`。不带任务 ID 的 `OK` 等确认词仅在当前群恰有
+一个待审批请求时生效；多个请求时会要求先选择。审批会检查 owner、原授权范围和
+有效期，恢复时不会延长有效期。已完成执行的结果仍可用于后续交付，不因等待交付跨过
+TTL 而重新执行或丢弃结果。旧版单请求审批文件仍可读取。
+
+确认正文只能由完整配置确认词组成，可接受 `好的，继续` 或 `确认 任务ID`；
+`不确认`、`确认一下原因` 等否定或普通追问不会作为同意执行。
+
 ## 安全语义：请按实现理解，不要只看模式名字
 
 `mode`、`reply_engine`、`codex_execute` 和 `code_write_policy` 共同决定行为，不能
@@ -175,13 +189,21 @@ dingding-me-agent --config ~/.dingding-me-agent/config.json --print-command
    Worker 会启动或恢复每群 Codex session，以生成本地草稿；当 `reply_engine=ai` 时，
    会调用 AI 回复引擎或回退到规则草稿。
 3. 通用代码桥接只会在 `guarded` / `autofix` 且 `codex_execute=true` 时运行：
-   `guarded` 请求只读 sandbox，`autofix` 还需要低风险、明确 BUG、高置信、可用仓库
-   和测试命令。
+   `guarded` 请求只读 sandbox，`autofix` 还需要 `code_write_policy=auto`、低风险、
+   明确 BUG、高置信、可用仓库和测试命令。默认 `none` 即使配合 autofix 也不写代码。
+   通过门禁的 autofix 在独立 worktree 内运行可写 Codex，之后由宿主
+   在该 worktree 运行配置的测试命令；测试失败会记录为失败。
 4. **重要例外**：当前 `code_write_policy=approval`、`codex_execute=true` 且授权 owner
    在待审批消息过期前发送确认词时，会创建独立 worktree 并以 `workspace-write` 执行
-   已批准任务；该确认路径不会额外检查 `mode=autofix`。若一个群必须保证不写代码，
+   已批准任务；AI 和 Codex 两种回复引擎均先保存 pending，再等待确认，不以
+   autofix 绕过审批。该确认路径不会额外检查 `mode=autofix`。若一个群必须保证不写代码，
    请设 `code_write_policy=none` 或 `codex_execute=false`，不要仅依赖 `mode=guarded`。
 5. 即使发生本地代码修改，Worker 也不会提交、推送、合并、发布、部署或写生产配置。
+
+群回复会话的新建与 `codex exec resume` 都显式请求 `read-only` sandbox；代码修改
+任务请求 `workspace-write`。这些是传给 Codex CLI 的执行选项，不是本项目自建的系统
+隔离层。宿主通过 shell 运行 `test_commands`，不受 Codex sandbox 限制；应仅配置
+已授权且适合本地环境的验证命令。
 
 对代码类群，推荐从下面的严格配置开始，先观察再显式开放：
 
@@ -246,14 +268,47 @@ dingding-me-agent-config --config ~/.dingding-me-agent/config.json
 ```text
 ~/.dingding-me-agent/
   config.json                       # 运行配置（由操作者维护）
-  seen.jsonl                        # 已处理事件去重记录
+  seen.jsonl                        # 保留的已处理事件去重记录
+  seen.sqlite3                     # 持久收件箱、步骤检查点、回复 outbox
+  seen.sqlite3.lock                # 同一数据库只允许一个 worker 进程
   codex-sessions/<conversation>/    # 每群 Codex thread、prompt、JSONL、最后回复
   codex-tasks/<task>/               # 分类、任务、Codex 日志、验证结果
-  pending-approvals/<group>.json    # 待 owner 确认的代码任务
+  pending-approvals/<group>.json    # 多个待 owner 确认的代码任务，兼容旧格式
   worktrees/<task>/                 # 已批准任务的独立 Git worktree
 ```
 
 这些文件是本地审计证据，不能代替远端发布或生产读回证据。
+
+### 并发与中断恢复
+
+`--max-workers` 默认 `3`，范围为 `1–32`；不同会话可并行，同一会话在一个 worker
+进程内按队列串行。`--runtime-db` 指定 SQLite 文件；省略时使用
+`Path(state_file).with_suffix(".sqlite3")`，因此默认是 `~/.dingding-me-agent/seen.sqlite3`。
+数据库使用 WAL、`synchronous=FULL` 和 `0600` 文件权限；进程锁覆盖其运行期。
+这是一台机器上的单进程调度器，没有跨机器租约或分布式 worker。
+
+```bash
+# 只读统计 jobs/steps/outbox 各状态，不启动 listener、不做恢复迁移
+dingding-me-agent --runtime-status
+
+# 指定数据库时，状态查询必须使用相同路径
+dingding-me-agent --runtime-db /ABS/PATH/TO/runtime.sqlite3 --runtime-status
+```
+
+启动会把中断的 `running` job 放回 `queued`，已开始但未确认完成的 step 标为
+`unknown`，发送中的 outbox 标为 `unknown`。处理时复用已完成检查点和已确认发送
+的回复；遇到 `unknown` 就停止该任务并记录需人工处理，**不会自动重跑模型/代码
+动作或重发未知消息**。排队任务还会核对授权快照；配置范围变化后会被 blocked。
+停止时保留尚未执行的队列，下次启动再核对策略。
+
+目前没有恢复 CLI。人工应先通过钉钉权威读回、任务日志、工作树和实际测试结果核对
+未知动作；不要删除数据库/检查点、切换新数据库或重新投递原请求来绕过状态。
+`--runtime-status` 仅显示计数和需处理 job ID，不会完成远端对账或批准重试。
+详细流程见 [中断恢复说明](docs/runtime-recovery.md)。
+
+可选 `ready_message` 的发送检查点若未知，会记录
+`ready_message_attention_required`，继续启动收件箱；这条招呼的结果与 listener 的
+`ready/connected` 健康证据应分别核对。
 
 ### 常驻服务
 
@@ -302,6 +357,7 @@ Git 的泛化授权。
 | 路径 | 内容 | 改动后验证 |
 | --- | --- | --- |
 | `src/dingding_me_agent/worker.py` | DWS 子进程、状态机、策略、Codex、审批与 worktree | `make check`、`make config-check` |
+| `src/dingding_me_agent/runtime.py` | SQLite 收件箱、检查点、outbox、进程锁、有界调度 | `make check` |
 | `src/dingding_me_agent/config_tui.py` | 配置 TUI 与 JSON 校验 | `make check` |
 | `tests/` | Worker/TUI 单元测试 | `make test` |
 | `config/agent-config.example.json` | 无真实信息的配置样例 | `make config-check` |
@@ -316,7 +372,8 @@ Git 的泛化授权。
 | 被 @ 仍没有正常回复 | `trigger=mention` 是否生效、DWS 身份是否是被 @ 的人、服务是否有新的 `ready/connected`、群是否在配置白名单。 |
 | 没有发送消息 | `send` 是否仍为 `false`，目标是否在允许范围，是否仅运行了 `--config-check`，以及 DWS 的发送权限。 |
 | “draft” 却看到 Codex | 这是 `reply_engine=codex` 的设计：它会生成本地会话草稿。要完全不调用 Codex，使用 `mode=observe`。 |
-| 确认词没有触发代码任务 | 检查 `code_write_policy=approval`、`approval_senders`、确认词、过期时间、`codex_execute`、仓库可用性。空审批人列表会失败关闭。 |
+| 确认词没有触发代码任务 | 检查 owner、原授权范围、TTL、`codex_execute` 和仓库；多请求时回复明确任务 ID。空审批人列表会失败关闭。 |
+| 重启后任务 blocked / unknown | 用相同 `--runtime-db` 查询 `--runtime-status`；先核对权威结果和授权变化，按 [恢复说明](docs/runtime-recovery.md) 人工处理，不通过重新投递绕过。 |
 | 不应写代码却创建了 worktree | 立即停止服务，并将该群设为 `codex_execute=false` 或 `code_write_policy=none`；见上文“重要例外”。 |
 | Codex 或本地测试失败 | 查看对应 `codex-tasks/<task>/` 的 `prompt.md`、`codex.err.log`、`last_message.md`、`verification.json` 和 stdout/stderr 日志。 |
 | 需要机器人身份而不是个人身份 | 本项目不适用；使用 `dws dev connect` 或单独的机器人 Stream 方案。 |
@@ -333,6 +390,19 @@ Git 的泛化授权。
 4. 只有新的 listener 有 fresh `ready` / `connected` 状态后，才允许新项目承担发送。
 
 本项目不会自动读取、修改或删除旧状态，也不会自动启停旧 LaunchAgent。
+
+升级 0.2.0 时保留原 `state-file`、Codex session、任务目录与审批文件；旧 seen.jsonl
+仍参与去重，SQLite 是新增账本。不要同时运行使用不同数据库但接收同一群的两个版本：
+数据库锁只保护同一路径，不会阻止两个独立状态目录重复处理同一来源。
+
+## 架构参考
+
+0.2.0 借鉴 DeepSeek 官方研究原型
+[dsh-superagent-prototype](https://github.com/deepseek-ai/dsh-superagent-prototype) 的
+持久任务状态、有界调度和 outbox 思路。本项目继续使用 DWS 个人 IM 入口、每群 Codex
+CLI 会话和 owner 门禁；没有引入其 DSH 执行器、完整 Ticket/Assignment/订阅模型、
+GitHub PR 生命周期或 Web 面板。SQLite 与发送 UUID 降低重复处理风险，但不保证所有
+外部动作只发生一次。
 
 ## 开发与验证
 

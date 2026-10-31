@@ -6,26 +6,14 @@ import pathlib
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+
+
 from unittest.mock import patch
 
 from dingding_me_agent import worker
 
+
 class AutoReplyWorkerTest(unittest.TestCase):
-    def parse(self, argv):
-        return worker.normalize_args(worker.build_parser().parse_args(argv))
-
-    def make_reply_skill(self, tmp, name="laoxing-test"):
-        skill_dir = pathlib.Path(tmp) / name
-        skill_dir.mkdir()
-        skill_path = skill_dir / "SKILL.md"
-        skill_path.write_text(
-            "---\nname: laoxing-test\n---\n# 老邢测试 Skill\n先判断，少废话，追证据，有下一步。",
-            encoding="utf-8",
-        )
-        return skill_path
-
-    def tearDown(self):
-        worker.load_reply_skill_context.cache_clear()
 
     def test_standalone_state_defaults_use_dedicated_home(self):
         previous = worker.os.environ.pop("DINGDING_ME_AGENT_HOME", None)
@@ -37,6 +25,7 @@ class AutoReplyWorkerTest(unittest.TestCase):
         finally:
             if previous is not None:
                 worker.os.environ["DINGDING_ME_AGENT_HOME"] = previous
+
 
     def test_standalone_state_home_environment_override(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -50,6 +39,7 @@ class AutoReplyWorkerTest(unittest.TestCase):
                     worker.os.environ.pop("DINGDING_ME_AGENT_HOME", None)
                 else:
                     worker.os.environ["DINGDING_ME_AGENT_HOME"] = previous
+
 
     def test_standalone_environment_names_win_over_legacy_dws_names(self):
         with patch.dict(worker.os.environ, {
@@ -68,6 +58,23 @@ class AutoReplyWorkerTest(unittest.TestCase):
                 worker.ai_credentials(args),
                 ("agent-key", "agent-model", "https://agent.example/v1"),
             )
+
+
+    def parse(self, argv):
+        return worker.normalize_args(worker.build_parser().parse_args(argv))
+
+    def make_reply_skill(self, tmp, name="laoxing-test"):
+        skill_dir = pathlib.Path(tmp) / name
+        skill_dir.mkdir()
+        skill_path = skill_dir / "SKILL.md"
+        skill_path.write_text(
+            "---\nname: laoxing-test\n---\n# 老邢测试 Skill\n先判断，少废话，追证据，有下一步。",
+            encoding="utf-8",
+        )
+        return skill_path
+
+    def tearDown(self):
+        worker.load_reply_skill_context.cache_clear()
 
     def test_build_consume_command_uses_flatten_ndjson_and_scope(self):
         args = self.parse([
@@ -858,6 +865,7 @@ class AutoReplyWorkerTest(unittest.TestCase):
     def test_autofix_requires_low_risk_bug_repo_tests_and_execute(self):
         args = self.parse([
             "--mode", "autofix",
+            "--code-write-policy", "auto",
             "--codex-execute",
             "--test-command", "python3 -m pytest",
         ])
@@ -871,7 +879,7 @@ class AutoReplyWorkerTest(unittest.TestCase):
             self.assertTrue(ok, reason)
 
     def test_autofix_blocks_high_risk_or_missing_tests(self):
-        args = self.parse(["--mode", "autofix", "--codex-execute"])
+        args = self.parse(["--mode", "autofix", "--codex-execute", "--code-write-policy", "auto"])
         with tempfile.TemporaryDirectory() as tmp:
             args.repo = tmp
             event = {"content": "明确 BUG：生产数据库删除报错", "message_id": "msg-risk"}

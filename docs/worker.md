@@ -1,430 +1,178 @@
-# Dingding Me Agent Worker
+# Dingding Me Agent Worker 0.2.0
 
-`dingding-me-agent` listens to DingTalk personal IM events with
-`dws event consume ... --flatten -f ndjson`, classifies project-group feedback,
-drafts or sends replies, and can route replies through a persistent per-group
-Codex session for memory and read-only local inspection.
+The worker consumes personal DingTalk events using the logged-in DWS user. It
+retains per-group Codex CLI sessions and can prepare locally verified code
+changes under explicit policy gates. It does not commit, push, merge, deploy,
+or publish automatically.
 
-This is a guarded worker, not a history polling script. It is designed for
-launchd/systemd/cron supervision.
+See [README](../README.md) for installation, configuration fields, environment
+precedence, and the configuration TUI. See [runtime recovery](runtime-recovery.md)
+for interrupted work and unknown delivery outcomes.
 
-## Safety Model
-
-- Default mode only prints reply drafts and Codex task prompts. It does not send
-  messages and does not start Codex.
-- Real sending requires `--send` plus a target scope such as `--group`,
-  `--open-dingtalk-id`, `--allow-conversation`, `--allow-sender`, or
-  `--allow-any-target`.
-- Real Codex execution requires `mode=guarded` or `mode=autofix` plus
-  `codex_execute=true` / `--codex-execute`.
-- `guarded` starts Codex in `read-only` sandbox for assessment only.
-- `autofix` starts Codex in `workspace-write` sandbox only for low-risk,
-  high-confidence, confirmed BUGs with a configured repo and test command.
-- `code_write_policy: "approval"` requires an explicit
-  `approval_senders` owner allowlist. If the allowlist is empty, confirmation
-  words fail closed: the pending approval stays pending and no code runs.
-- Approved code changes are developed in a separate git worktree under
-  `~/.dingding-me-agent/worktrees/` on a `codex/dingtalk/...` branch. The worker
-  never commits, pushes, deploys, or publishes automatically.
-- After Codex returns from an approved code task, the worker runs the configured
-  `test_commands` in that worktree and stores logs in the task bundle.
-- Each event is de-duplicated in `~/.dingding-me-agent/seen.jsonl`.
-- The worker keeps `dws event consume` stdin open and stops it with SIGTERM, so
-  self-created personal subscriptions can be cleaned up by the existing event
-  command.
-
-See [`dws-codex-personal-agent-spec.md`](dws-codex-personal-agent-spec.md) for
-the full state machine and product-agent workflow.
-
-## AI Provider
-
-Set an OpenAI-compatible endpoint with environment variables:
+## Entry points and configuration
 
 ```bash
-export DINGDING_ME_AGENT_AI_API_KEY="..."
-export DINGDING_ME_AGENT_AI_MODEL="..."
-# Optional. Defaults to https://api.openai.com/v1
-export DINGDING_ME_AGENT_AI_BASE_URL="https://api.openai.com/v1"
+dingding-me-agent --config /ABS/PATH/TO/config.json --config-check
+dingding-me-agent-config --config /ABS/PATH/TO/config.json --validate
 ```
 
-Secrets should stay in the process environment or an OS service environment
-file. Do not put API keys into the repository or launchd plist committed to git.
+These checks do not start a listener, send messages, or invoke Codex. By
+contrast, `--print-command` prints the listener command and then starts the
+service. The configuration TUI saves atomically with a backup; it does not
+start or restart the service.
 
-Classification defaults to local deterministic rules (`--classifier heuristic`)
-so the worker can route feedback even without an AI provider. Use
-`--classifier hybrid` to ask the model for structured classification when
-credentials exist and fall back to rules if the model fails. Dialogue reply text
-uses `reply_engine`:
+The safe sample is [agent-config.example.json](../config/agent-config.example.json).
+Keep actual IDs, repositories, skills, tokens, and state outside the checkout.
+The default state root is `~/.dingding-me-agent/`, overridable through
+`DINGDING_ME_AGENT_HOME`. DWS login remains managed by DWS.
 
-- `reply_engine: "ai"` calls the configured OpenAI-compatible chat endpoint for
-  a one-shot reply.
-- `reply_engine: "codex"` resumes or creates one Codex session per group and
-  asks Codex to produce the DingTalk reply. This preserves Codex conversation
-  history and can use read-only local repository inspection when that repo is
-  configured and the message matches the code keywords.
+## Intake and dispatch
 
-When Codex session reply is enabled, DWS still only listens and sends; Codex
-does the thinking and any allowed read-only probing.
+The transport is `dws event consume ... --flatten -f ndjson`, with the child's
+stdin kept open until shutdown. History reads can supply recent context; they
+do not replace the event stream.
 
-Set `reply_skill` to inject a local Codex skill into every reply prompt. For
-example, `reply_skill: "laoxing"` loads the local 老邢 skill and its style
-references so both one-shot AI replies and persistent Codex session replies use
-the same voice.
-
-Set `codex_audit_session_dir` to mirror each persistent Codex conversation into
-a human-visible local project. The worker still keeps its machine resume state
-under `codex_session_dir`; the audit directory receives readable copies of
-`session.json`, prompts, last replies, Codex JSONL logs, and an `events.jsonl`
-index for review. These files can contain DingTalk message context, so keep the
-audit project local/private.
-
-For code-like feedback, set `codex_proactive_followup: true` to avoid a pure
-one-question-one-answer flow: the worker sends a short acknowledgement, runs a
-read-only Codex review, then sends the diagnosis or confirmation request back
-to the group.
-
-Set `requirements_skill: "grillme"` to make code-oriented Codex prompts use a
-focused requirement-confirmation pass. Codex should first use the current
-message, recent chat context, docs/screenshots, and local code inspection; it
-only asks the group when business goals, boundaries, acceptance samples,
-priority, or risk trade-offs are still missing.
-
-## Dry Run
-
-### Config allowlist
-
-For project-group automation, prefer a JSON allowlist config. The worker only
-starts listeners for enabled groups in this file, and every event is checked
-again against the configured `conversation_id` before AI generation or sending.
-
-Start from [`agent-config.example.json`](../config/agent-config.example.json):
-
-```json
-{
-  "defaults": {
-    "mode": "draft",
-    "query": "问题,反馈,bug,报错,不能用,需求",
-    "ready_message": "",
-    "send": false,
-    "reply_engine": "codex",
-    "reply_skill": "",
-    "reply_skill_path": "",
-    "codex_audit_session_dir": "",
-    "codex_proactive_followup": false,
-    "requirements_skill": "grillme",
-    "codex_execute": false
-  },
-  "groups": [
-    {
-      "name": "赢在AI",
-      "group": "cid_REPLACE_WINYAI",
-      "project": "winyai",
-      "repo": "",
-      "query": "问题,反馈,bug,报错,不能用,需求",
-      "ready_message": "我在了",
-      "enabled": true
-    },
-    {
-      "name": "抓虾反馈群",
-      "group": "cid_REPLACE_CRAWSHRIMP",
-      "project": "crawshrimp",
-      "repo": "/ABS/PATH/TO/crawshrimp",
-      "mode": "guarded",
-      "reply_engine": "codex",
-      "code_keywords": ["抓虾", "crawshrimp"],
-      "query": "抓虾,AI视频,生图,鞋包,报错,不能用,需求",
-      "test_commands": ["python3 -m pytest"],
-      "code_write_policy": "approval",
-      "approval_senders": ["openDingtalkId-or-userId-of-owner"],
-      "enabled": true
-    }
-  ]
-}
-```
-
-Validate the config and print the exact `dws event consume` commands without
-starting any listener:
+- A group trigger uses a group-message listener.
+- A mention trigger uses an @ listener and a local conversation admission gate.
+- Mention plus approval policy adds a group-message listener for owner
+  confirmations. Ordinary unmentioned messages on that listener do not create
+  normal reply requests.
+- Receive type and conversation admission are checked before runtime enqueue.
+  Both listener routes share the conversation lane and durable message identity.
+- The default worker pool processes up to three conversations concurrently.
+  One conversation, scoped by DWS profile, remains serial within this process.
 
 ```bash
-dingding-me-agent \
-  --config ~/.dingding-me-agent/config.json \
-  --config-check
+# Starts a service; use only with an authorized runtime configuration.
+dingding-me-agent --config /ABS/PATH/TO/config.json --max-workers 3
 ```
 
-Run all enabled group listeners in draft mode:
+`--max-workers` accepts 1–32. This is single-process, bounded thread scheduling,
+not a distributed agent cluster or a task-per-Codex-session implementation.
 
-```bash
-dingding-me-agent \
-  --config ~/.dingding-me-agent/config.json \
-  --print-command
-```
+## Mode and execution boundaries
 
-Config mode uses `user_im_message_receive_group` and one consumer per group.
-This matches the DWS event contract: one `event consume` process owns one event
-subscription scope.
+| Mode / path | Model behavior | Code behavior |
+| --- | --- | --- |
+| `observe` | Classifies, then stops; the configured classifier can use AI | No Codex execution or reply generation |
+| `draft` | AI drafts or a persistent Codex session generates a local draft | General bridge prepares tasks without executing them |
+| `guarded` | Replies only when `send=true`; general code review also requires `codex_execute=true` | General review requests `read-only` |
+| `autofix` | Requires `code_write_policy=auto`, an explicit low-risk BUG, confidence threshold, repo, tests, and execution flag | Creates a separate worktree, requests `workspace-write`, then runs host tests |
+| Owner-approved code task | Requires approval policy, configured owner, matching authorization, and `codex_execute=true` | Creates a separate worktree and requests `workspace-write`; does not additionally require `mode=autofix` |
 
-### Config TUI
+`draft` suppresses sending but does not suppress Codex session generation when
+`reply_engine=codex`. The approval-confirmation route runs before ordinary
+mode-based feedback processing: use `code_write_policy=none` or
+`codex_execute=false` when local code changes must be disabled.
 
-Use the local terminal UI to inspect and edit configured group avatars:
+The default write policy `none` also blocks ordinary autofix. With `approval`,
+both AI and Codex reply engines save a pending request before code execution;
+autofix mode does not bypass that approval.
 
-```bash
-dingding-me-agent-config \
-  --config ~/.dingding-me-agent/config.json
-```
+New and resumed group reply sessions explicitly request the Codex CLI's
+`read-only` sandbox. Code-change tasks request `workspace-write`. The host runs
+configured `test_commands` through a shell in the task worktree, outside that
+Codex sandbox. The worker does not implement a separate OS sandbox.
 
-The TUI shows every configured group, including disabled groups, with project,
-strategy (`mode/trigger/reply_engine`), active listener count, and permissions
-such as send, Codex execution, write policy, history context, proactive
-follow-up, audit mirroring, and `owner:N` for code-approval owners. It also
-supports duplicating a group as a disabled copy, so the same project can be
-opened by multiple group avatars with different group IDs or policies.
+Autofix and approved tasks retain `worktree.json`, Codex logs, and host
+`verification.json`. Configured test failure makes the result failed. An
+approved task with no configured tests cannot claim test verification merely
+because Codex exits zero. A zero exit or a model's `FIXED` text is not evidence
+of a deployed fix.
 
-Useful keys:
+## Persistent state
 
-| Key | Action |
-|---|---|
-| `e` | enable or disable the selected group |
-| `m` | cycle automation mode |
-| `t` | switch trigger between mention-only and all group messages |
-| `r` | switch reply engine between Codex session and one-shot AI |
-| `s` | toggle real send permission |
-| `x` | toggle Codex execution |
-| `w` | cycle code write policy (`none` / `approval` / `auto`) |
-| `p` | toggle proactive follow-up |
-| `h`, `+`, `-` | toggle history context and adjust history limit |
-| `a` | add a disabled group config |
-| `d` | duplicate the selected group as a disabled copy |
-| `Enter` | edit text fields like group id, project, repo, skill, audit dir |
-| `v` | validate the config |
-| `S` | save atomically with a timestamped backup |
-
-Use `Enter` and edit `approval_senders` to set the comma-separated owner
-identities that may approve code changes. Prefer `openDingTalkId` from
-`dws contact user search --query "姓名" --format json`; `userId` is also
-accepted when that appears in event payloads.
-
-For non-interactive review:
-
-```bash
-dingding-me-agent-config \
-  --config ~/.dingding-me-agent/config.json \
-  --summary-json
-
-dingding-me-agent-config \
-  --config ~/.dingding-me-agent/config.json \
-  --validate
-```
-
-To send a connection marker after the listener is ready, set
-`ready_message` on the group:
-
-```json
-{
-  "name": "赢在AI",
-  "group": "cidxxxxxxxx",
-  "project": "winyai",
-  "mode": "draft",
-  "ready_message": "我在了",
-  "enabled": true
-}
-```
-
-Draft replies for messages that @ you:
-
-```bash
-dingding-me-agent \
-  --event-key user_im_message_receive_at \
-  --print-command
-```
-
-Draft replies for one group:
-
-```bash
-dingding-me-agent \
-  --event-key user_im_message_receive_group \
-  --group cidxxxxxxxx \
-  --query "找我,帮忙,确认" \
-  --print-command
-```
-
-The worker prints one JSON object per handled event:
-
-```json
-{"action":"draft","event_id":"...","reply":"我先确认一下，稍后回复。"}
-```
-
-Code-affecting messages print a Codex state instead:
-
-```json
-{"action":"codex_draft","classification":{"type":"feature","needs_code":true},"task_id":"..."}
-```
-
-Task bundles are stored under:
+By default:
 
 ```text
-~/.dingding-me-agent/codex-tasks/<task_id>/
+~/.dingding-me-agent/
+  config.json
+  seen.jsonl
+  seen.sqlite3
+  seen.sqlite3.lock
+  codex-sessions/<conversation>/
+  codex-tasks/<task>/
+  pending-approvals/<group>.json
+  worktrees/<task>/
 ```
 
-Persistent group Codex session metadata and per-message logs are stored under:
+`--runtime-db` selects a different SQLite path. Otherwise the path is
+`Path(state_file).with_suffix(".sqlite3")`: changing `--state-file` also changes
+the default runtime database. The lock protects that database path only.
+
+The runtime stores inbox jobs, step checkpoints, and ordinary reply outbox
+records in SQLite with WAL, `synchronous=FULL`, and a `0600` database file.
+Legacy `seen.jsonl` remains an input to duplicate suppression. Session and task
+artifacts remain separate files, not database-backed conversation memory.
+
+Completed steps are reused. Interrupted started steps become `unknown` on
+restart; sending outbox records also become `unknown`. They require manual
+reconciliation and are not replayed automatically. Running jobs return to the
+queue, but their uncertain steps still prevent re-execution. Queued jobs whose
+registered policy changed are blocked. Missing routes are also blocked.
+
+Stopping intake preserves queued jobs. Shutdown does not start the remaining
+backlog; already-running work may finish while the process waits. A forced
+termination leaves recovery guards for the next startup.
+
+## Owner approval
+
+One group can retain several pending requests. Use the ID printed in the reply:
 
 ```text
-~/.dingding-me-agent/codex-sessions/<conversation_id>/
+确认 dws-codex-0123456789abcdef0123
 ```
 
-Approved code-change worktrees are stored under:
+Plain confirmation phrases such as `OK` work only for a unique pending request.
+Multiple requests require selection. The owner allowlist fails closed when
+empty, and display names do not confer authority. The saved authorization
+snapshot must still match the current policy. Legacy single-request approval
+files remain readable; their stored group/project/repo scope is checked.
 
-```text
-~/.dingding-me-agent/worktrees/<approved_task_id>/
-```
+Confirmation must consist of whole configured phrases, optionally combined
+(for example, `好的，继续`) and a task ID. A negation such as `不确认` or a
+question such as `确认一下原因` does not grant approval.
 
-The matching task bundle records `worktree.json`, Codex JSONL logs, and
-`verification.json` plus one stdout/stderr log pair per configured verification
-command.
+Repeated handling does not renew the original approval TTL. An already-recorded
+execution checkpoint is not discarded solely because delivery crossed that
+TTL: completed execution is reused, and uncertain execution stays guarded.
+Approval delivery identity belongs to the task, so later confirmations do not
+create a fresh delivery identity. Pending approval is cleared after delivery
+returns, rather than before the delivery attempt.
 
-## Automation Modes
-
-| Mode | Sends replies | Starts Codex | Can modify code |
-|---|---:|---:|---:|
-| `observe` | no | no | no |
-| `draft` | no | no | no |
-| `guarded` | yes, with `send=true` | yes, with `codex_execute=true` | no |
-| `autofix` | yes, with `send=true` | yes, with `codex_execute=true` | gated low-risk BUG only |
-
-For `autofix`, configure at least one test command:
-
-```json
-{
-  "name": "抓虾反馈群",
-  "group": "cid_REPLACE_CRAWSHRIMP",
-  "project": "crawshrimp",
-  "repo": "/ABS/PATH/TO/crawshrimp",
-  "mode": "autofix",
-  "send": true,
-  "codex_execute": true,
-  "test_commands": ["python3 -m pytest"],
-  "enabled": true
-}
-```
-
-Autofix is blocked when the feedback is a feature, suspected BUG, high-risk
-operation, missing repo, missing test command, or below the confidence
-threshold.
-
-## Real Sending
-
-Reply in a single allowlisted group:
+## Status and observability
 
 ```bash
-dingding-me-agent \
-  --event-key user_im_message_receive_group \
-  --group cidxxxxxxxx \
-  --allow-conversation cidxxxxxxxx \
-  --send
+dingding-me-agent --runtime-status
+dingding-me-agent --runtime-db /ABS/PATH/TO/runtime.sqlite3 --runtime-status
 ```
 
-Or enable sending for exactly one configured group:
+Status opens an existing database read-only, prints counts for jobs/steps/outbox
+and attention job IDs, and exits. It does not connect DWS, acquire the service
+lock, migrate tables, reconcile unknown rows, or approve retries.
 
-```json
-{
-  "name": "抓虾反馈群",
-  "group": "cid_REPLACE_CRAWSHRIMP",
-  "project": "crawshrimp",
-  "repo": "/ABS/PATH/TO/crawshrimp",
-  "mode": "send",
-  "send": true,
-  "enabled": true
-}
-```
+Worker stdout contains JSON actions such as `runtime_opened`, `runtime_ready`,
+`runtime_attention_required`, classification, and delivery results. Optional
+`codex_audit_session_dir` mirrors prompts, outputs, and session metadata for
+human inspection. Logs and mirrors can contain private business context.
 
-In config mode, a group with `send: true` automatically allowlists only that
-same group as a delivery target. Other conversations are skipped before the AI
-call.
+Listener `ready` / `connected`, optional `ready_message`, actual reply delivery,
+code execution, local tests, and remote deployment are separate evidence.
+An uncertain optional greeting records `ready_message_attention_required` and
+does not prevent inbox startup; its checkpoint still blocks automatic replay.
 
-Reply to a single allowlisted openDingtalkId:
+## Verification and reference
 
 ```bash
-dingding-me-agent \
-  --event-key user_im_message_receive_o2o \
-  --open-dingtalk-id openxxxxxxxx \
-  --allow-sender openxxxxxxxx \
-  --send
+make check
+make config-check
+git diff --check
 ```
 
-`--reply-target auto` sends group and @ replies back to the conversation, and
-single-chat replies back to the sender. Use `--reply-target sender` if you want
-private replies for a sender-scoped subscription.
+These are local checks. They do not establish installed service health or
+production delivery. The GitHub Actions matrix covers Python 3.10 and 3.13.
 
-## macOS launchd
-
-For 7x24 running, prefer launchd `KeepAlive` over polling message history.
-Use the maintained template at `service/com.dingding-me-agent.plist.template` and replace paths,
-IDs, model, and base URL.
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.dingding-me-agent</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/ABS/PATH/TO/dingding-me-agent/.venv/bin/dingding-me-agent</string>
-    <string>--config</string>
-    <string>/ABS/PATH/TO/config.json</string>
-    <string>--print-command</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>ThrottleInterval</key>
-  <integer>10</integer>
-  <key>StandardOutPath</key>
-  <string>/tmp/dingding-me-agent.out.log</string>
-  <key>StandardErrorPath</key>
-  <string>/tmp/dingding-me-agent.err.log</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
-    <key>DINGDING_ME_AGENT_AI_API_KEY</key>
-    <string>REPLACE_WITH_RUNTIME_SECRET</string>
-    <key>DINGDING_ME_AGENT_AI_MODEL</key>
-    <string>REPLACE_WITH_MODEL</string>
-    <key>DINGDING_ME_AGENT_AI_BASE_URL</key>
-    <string>https://api.openai.com/v1</string>
-  </dict>
-</dict>
-</plist>
-```
-
-Load and inspect:
-
-```bash
-launchctl load -w ~/Library/LaunchAgents/com.dingding-me-agent.plist
-tail -f /tmp/dingding-me-agent.out.log /tmp/dingding-me-agent.err.log
-```
-
-Unload:
-
-```bash
-launchctl unload -w ~/Library/LaunchAgents/com.dingding-me-agent.plist
-```
-
-## Periodic Window
-
-If you explicitly want cron-style periodic windows, keep event consumption
-bounded:
-
-```bash
-*/15 * * * * DINGDING_ME_AGENT_AI_API_KEY=... DINGDING_ME_AGENT_AI_MODEL=... \
-  /ABS/PATH/TO/dingding-me-agent/.venv/bin/dingding-me-agent \
-    --event-key user_im_message_receive_at \
-    --duration 14m \
-    >> /tmp/dingding-me-agent.out.log 2>> /tmp/dingding-me-agent.err.log
-```
-
-This only handles messages received while the worker is running. For production
-auto-reply, launchd/systemd supervision is more reliable.
+The persistence and scheduling changes draw on DeepSeek's official research
+prototype [dsh-superagent-prototype](https://github.com/deepseek-ai/dsh-superagent-prototype).
+This worker retains DWS and Codex CLI; it has no DSH execution dependency,
+complete Ticket/Assignment subscription model, PR lifecycle, or Web dashboard.

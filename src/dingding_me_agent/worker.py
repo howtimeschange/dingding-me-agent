@@ -22,16 +22,78 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
+import tempfile
 import urllib.error
 import urllib.request
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
+
+
+@functools.lru_cache(maxsize=1)
+def load_runtime_module() -> Any:
+    """Load the standalone package's runtime without depending on the DWS checkout."""
+    from . import runtime
+    return runtime
+
+class RecoveryRequired(RuntimeError):
+    """An interrupted external action must be reconciled before continuing."""
+
+
+def authorization_snapshot(args: argparse.Namespace) -> dict[str, Any]:
+    """Only local configuration grants authority; never save credentials here."""
+    return {
+        "profile": args.profile, "group": args.group, "project": args.project,
+        "repos": list(configured_repos(args)), "mode": effective_mode(args),
+        "send": args.send,
+        "reply_target": "conversation" if args.group and args.reply_target in {"auto", "conversation"} else args.reply_target,
+        "allow_any_target": args.allow_any_target,
+        "allow_conversation": sorted(args.allow_conversation),
+        "allow_sender": sorted(args.allow_sender),
+        "admit_conversation": sorted(args.admit_conversation),
+        "codex_execute": args.codex_execute, "code_write_policy": args.code_write_policy,
+        "approval_sender": sorted(args.approval_sender),
+        "approval_phrase": list(args.approval_phrase),
+        "approval_ttl_minutes": args.approval_ttl_minutes,
+        "test_commands": list(test_commands(args)),
+        "code_keywords": sorted(args.code_keyword), "trigger": args.trigger,
+        "reply_engine": args.reply_engine,
+    }
+
+
+def runtime_scope(args: argparse.Namespace, event: Optional[dict[str, Any]] = None) -> str:
+    conversation = str((event or {}).get("conversation_id") or args.group or "direct")
+    return hashlib.sha256(json.dumps([args.profile, conversation], ensure_ascii=False).encode()).hexdigest()
+
+
+def runtime_event_key(event: dict[str, Any], args: argparse.Namespace) -> str:
+    # Both @ and group listeners can deliver the same message with different event IDs.
+    identity = str(event.get("message_id") or event_key_for_dedupe(event))
+    return runtime_scope(args, event) + ":" + identity
+
+
+def checkpoint(args: argparse.Namespace, step_id: str, kind: str, execute: Any) -> Any:
+    store = getattr(args, "_runtime_store", None)
+    if store is None:
+        return execute()
+    step = store.begin_step(step_id, kind, {"authorization": authorization_snapshot(args)})
+    if step.status == "completed":
+        return step.result
+    if step.status != "started":
+        raise RecoveryRequired(f"step {step_id} has an unknown outcome; inspect its artifacts before retrying")
+    result = execute()
+    store.finish_step(step_id, result)
+    return result
+
+
+def event_checkpoint(event: dict[str, Any], args: argparse.Namespace, kind: str, execute: Any) -> Any:
+    return checkpoint(args, runtime_event_key(event, args) + ":" + kind, kind, execute)
 
 
 RECEIVE_EVENTS = {
@@ -255,6 +317,7 @@ def default_agent_home() -> Path:
     if raw:
         return Path(raw).expanduser()
     return Path.home() / ".dingding-me-agent"
+
 
 
 def default_state_file() -> Path:
@@ -1526,6 +1589,18 @@ def send_ready_message(args: argparse.Namespace) -> dict[str, Any]:
     return payload
 
 
+def notify_ready(args: argparse.Namespace) -> None:
+    if not args.ready_message:
+        return
+    target = ReplyTarget("--group" if args.group else "--open-dingtalk-id", args.group or args.open_dingtalk_id)
+    try:
+        checkpoint(args, ready_uuid(target, args.ready_message), "ready-message", lambda: send_ready_message(args))
+    except Exception as exc:
+        # An optional greeting must never prevent the inbox from recovering.
+        # Its checkpoint remains unknown and is not automatically replayed.
+        log_json({"action": "ready_message_attention_required", "error_type": type(exc).__name__})
+
+
 def send_reply(
     event: dict[str, Any],
     target: ReplyTarget,
@@ -1534,23 +1609,49 @@ def send_reply(
     *,
     purpose: str = "reply",
 ) -> dict[str, Any]:
-    cmd = build_send_command(args.dws_bin, args.profile, target, reply, send_uuid(event, target, purpose))
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=args.dws_timeout,
-        check=False,
-    )
+    uuid = send_uuid(event, target, args.profile + ":" + purpose if args.profile else purpose)
+    store = getattr(args, "_runtime_store", None)
+    if store is not None:
+        if not args.send or not target_allowed(target, args):
+            raise ValueError("outbox delivery is outside the current send policy")
+        store.enqueue_outbox(uuid, args.profile, {"flag": target.flag, "value": target.value}, reply,
+                             effective_mode(args), {"authorization": authorization_snapshot(args)})
+        item = store.get_outbox(uuid)
+        if item.status == "sent":
+            return item.result or {}
+        if store.claim_outbox(uuid) is None:
+            raise RecoveryRequired(f"outbox {uuid} has an unknown outcome; verify DingTalk before any resend")
+    cmd = build_send_command(args.dws_bin, args.profile, target, reply, uuid)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=args.dws_timeout, check=False)
+    except Exception as exc:
+        if store is not None:
+            store.mark_outbox_unknown(uuid, type(exc).__name__)
+            raise RecoveryRequired(f"outbox {uuid} interrupted; delivery outcome needs reconciliation") from exc
+        raise
     if result.returncode != 0:
         duplicate = duplicate_uuid_payload(result.stderr)
         if duplicate:
+            if store is not None:
+                store.finish_outbox(uuid, duplicate)
             return duplicate
+        if store is not None:
+            store.mark_outbox_unknown(uuid, f"dws_exit_{result.returncode}")
+            raise RecoveryRequired(f"outbox {uuid} failed without authoritative delivery status")
         raise RuntimeError(result.stderr.strip() or f"dws exited {result.returncode}")
     try:
-        return json.loads(result.stdout)
+        payload = json.loads(result.stdout)
     except json.JSONDecodeError:
-        return {"stdout": result.stdout.strip()}
+        if store is not None:
+            store.mark_outbox_unknown(uuid, "invalid_json_response")
+            raise RecoveryRequired(f"outbox {uuid} has no valid delivery receipt") from None
+        payload = {"stdout": result.stdout.strip()}
+    if store is not None:
+        if not isinstance(payload, dict) or not payload or payload.get("success") is False or payload.get("error"):
+            store.mark_outbox_unknown(uuid, "invalid_delivery_receipt")
+            raise RecoveryRequired(f"outbox {uuid} has no confirmed delivery receipt")
+        store.finish_outbox(uuid, payload)
+    return payload
 
 
 def task_id_for_event(event: dict[str, Any], classification: ClassificationResult) -> str:
@@ -1826,8 +1927,23 @@ def sync_codex_audit_session(
 
 
 def write_json_file(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def safe_file_stem(value: str) -> str:
@@ -1908,11 +2024,12 @@ def approval_sender_allowed(event: dict[str, Any], pending: dict[str, Any], args
 def normalize_confirmation_text(value: str) -> str:
     value = value.lower()
     value = re.sub(r"@\S+", "", value)
-    value = re.sub(r"[\s,，。.!！?？:：;；、\"'“”‘’（）()【】\\[\\]<>《》-]+", "", value)
+    value = re.sub(r"[\s,，。.!！?？:：;；、\"'“”‘’（）()【】\[\]<>《》-]+", "", value)
     return value
 
 
 def is_approval_confirmation(content: str, args: argparse.Namespace) -> bool:
+    content = re.sub(r"dws-codex-[0-9a-f]{20}", "", content, flags=re.IGNORECASE)
     normalized = normalize_confirmation_text(content)
     if not normalized:
         return False
@@ -1924,10 +2041,18 @@ def is_approval_confirmation(content: str, args: argparse.Namespace) -> bool:
     normalized_phrases = tuple(normalize_confirmation_text(item) for item in phrases)
     if normalized in normalized_phrases:
         return True
-    return len(normalized) <= 20 and any(phrase and phrase in normalized for phrase in normalized_phrases)
+    # A question such as “确认一下原因” or a negation such as “不确认” is not
+    # consent. Allow only whole configured phrases (including “好的，继续”).
+    reachable = {0}
+    for position in range(len(normalized)):
+        if position in reachable:
+            for phrase in normalized_phrases:
+                if phrase and normalized.startswith(phrase, position):
+                    reachable.add(position + len(phrase))
+    return len(normalized) in reachable
 
 
-def load_pending_approval(args: argparse.Namespace) -> dict[str, Any]:
+def load_pending_approvals(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
     path = pending_approval_path(args)
     if not path.exists():
         return {}
@@ -1935,10 +2060,34 @@ def load_pending_approval(args: argparse.Namespace) -> dict[str, Any]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    if data.get("version") == 2 and isinstance(data.get("pending"), dict):
+        return {str(key): item for key, item in data["pending"].items() if isinstance(item, dict)}
+    # Preserve the pre-runtime single-request format, including active approvals.
+    if data.get("approval_id"):
+        return {str(data["approval_id"]): data}
+    return {}
 
 
-def clear_pending_approval(args: argparse.Namespace) -> None:
+def load_pending_approval(args: argparse.Namespace, approval_id: str = "") -> dict[str, Any]:
+    pending = load_pending_approvals(args)
+    if approval_id:
+        return pending.get(approval_id, {})
+    return next(iter(pending.values())) if len(pending) == 1 else {}
+
+
+def clear_pending_approval(args: argparse.Namespace, approval_id: str = "") -> None:
+    pending = load_pending_approvals(args)
+    if not approval_id and len(pending) > 1:
+        raise ValueError("select an approval ID before clearing multiple pending tasks")
+    if approval_id:
+        pending.pop(approval_id, None)
+    else:
+        pending.clear()
+    if pending:
+        write_json_file(pending_approval_path(args), {"version": 2, "pending": pending})
+        return
     try:
         pending_approval_path(args).unlink()
     except FileNotFoundError:
@@ -1981,8 +2130,16 @@ def save_pending_approval(
             "recent_history_context": event.get("_history_context", []),
         },
         "classification": classification.to_dict(),
+        "authorization": authorization_snapshot(args),
     }
-    write_json_file(pending_approval_path(args), pending)
+    all_pending = load_pending_approvals(args)
+    previous = all_pending.get(pending["approval_id"])
+    if previous:
+        # Recovery must not renew the TTL or replace the original approval scope.
+        pending["created_at"] = previous.get("created_at", pending["created_at"])
+        pending["authorization"] = previous.get("authorization", pending["authorization"])
+    all_pending[pending["approval_id"]] = pending
+    write_json_file(pending_approval_path(args), {"version": 2, "pending": all_pending})
     return pending
 
 
@@ -2008,6 +2165,8 @@ def is_autofix_eligible(classification: ClassificationResult, args: argparse.Nam
         return False, "mode_not_autofix"
     if not bool(getattr(args, "codex_execute", False)):
         return False, "codex_execute_disabled"
+    if getattr(args, "code_write_policy", "none") != "auto":
+        return False, "auto_write_not_authorized"
     if classification.type != "bug":
         return False, "not_confirmed_bug"
     if classification.confidence < float(getattr(args, "autofix_min_confidence", 0.85)):
@@ -2493,9 +2652,12 @@ def build_codex_session_command(
     last_message_path = session_dir / "last_message.md"
     model = str(getattr(args, "codex_model", "") or "").strip()
     if thread_id:
+        repo = primary_repo(args)
         cmd = [
             args.codex_bin,
             "exec",
+            "--cd", repo if repo_available(repo) else str(Path.cwd()),
+            "--sandbox", "read-only",
             "resume",
             "--json",
             "--output-last-message",
@@ -2680,7 +2842,19 @@ def run_codex_bridge(event: dict[str, Any], classification: ClassificationResult
         write_json_file(task_dir / "status.json", result.to_dict())
         return result
 
-    cmd = build_codex_command(args, classification, task_dir)
+    worktree_path = branch_name = ""
+    command_classification = classification
+    if mode == "autofix":
+        repo = str(classification.codex_task.get("repo") or primary_repo(args)).strip()
+        worktree_path, branch_name, _repo_root = create_codex_task_worktree(repo, task_id, args)
+        command_classification = ClassificationResult(**{
+            **classification.to_dict(), "codex_task": {**classification.codex_task, "repo": worktree_path},
+        })
+        prompt += (f"\n## Isolated Assignment\n只允许修改独立工作树：{worktree_path}；分支：{branch_name}。"
+                   "禁止提交、推送、合并、发布、部署或写生产配置。\n")
+        (task_dir / "prompt.md").write_text(prompt, encoding="utf-8")
+        write_json_file(task_dir / "worktree.json", {"repo": repo, "worktree_path": worktree_path, "branch": branch_name})
+    cmd = build_codex_command(args, command_classification, task_dir)
     stdout_path = task_dir / "codex.jsonl"
     stderr_path = task_dir / "codex.err.log"
     with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
@@ -2697,15 +2871,26 @@ def run_codex_bridge(event: dict[str, Any], classification: ClassificationResult
     last_path = task_dir / "last_message.md"
     if last_path.exists():
         last_message = last_path.read_text(encoding="utf-8", errors="replace")
+    verification = None
+    status = "completed" if completed.returncode == 0 else "failed"
+    reason = "" if completed.returncode == 0 else f"codex_exit_{completed.returncode}"
+    if mode == "autofix" and completed.returncode == 0:
+        verification = run_verification_commands(worktree_path, test_commands(args), task_dir, args.verify_timeout)
+        write_json_file(task_dir / "verification.json", verification)
+        if not verification.get("passed"):
+            status, reason = "failed", "verification_failed"
     result = CodexBridgeResult(
         task_id=task_id,
-        status="completed" if completed.returncode == 0 else "failed",
+        status=status,
         task_dir=str(task_dir),
-        reason="" if completed.returncode == 0 else f"codex_exit_{completed.returncode}",
+        reason=reason,
         command=tuple(cmd),
         executed=True,
         returncode=completed.returncode,
         last_message=last_message,
+        worktree_path=worktree_path,
+        branch=branch_name,
+        verification=verification,
         delivery_message="",
     )
     result = CodexBridgeResult(**{**result.to_dict(), "delivery_message": build_delivery_message(classification, result)})
@@ -2746,14 +2931,69 @@ def start_stdout_pump(consumer: ManagedConsumer, seen: set[str], lock: threading
                 print(f"WARN: {consumer.label}: skip invalid event JSON: {e}", file=sys.stderr)
                 continue
             try:
-                with lock:
-                    process_event(event, seen, consumer.args)
+                # Intake only writes a durable job; no model/test/network call holds
+                # the shared intake lock. The scheduler serializes each conversation.
+                dispatch_event(event, seen, consumer.args, lock)
             except Exception as e:  # keep worker alive across bad events
                 print(f"ERROR: {consumer.label}: process event failed: {e}", file=sys.stderr)
 
     thread = threading.Thread(target=pump, name=f"{consumer.label}-stdout", daemon=True)
     thread.start()
     return thread
+
+
+def runtime_route(args: argparse.Namespace) -> str:
+    return runtime_scope(args) + (":approval" if getattr(args, "approval_only", False) else ":main")
+
+
+def register_runtime_handler(args: argparse.Namespace, seen: set[str]) -> None:
+    scheduler = getattr(args, "_runtime_scheduler", None)
+    if scheduler is not None:
+        scheduler.register(runtime_route(args), authorization_snapshot(args), lambda event: process_event(event, seen, args))
+
+
+def dispatch_event(event: dict[str, Any], seen: set[str], args: argparse.Namespace, lock: threading.Lock) -> None:
+    scheduler = getattr(args, "_runtime_scheduler", None)
+    if scheduler is None:
+        with lock:
+            process_event(event, seen, args)
+        return
+    if not isinstance(event, dict):
+        raise ValueError("event must be a JSON object")
+    if str(event.get("type") or args.event_key) not in RECEIVE_EVENTS or admission_failure(event, args):
+        return
+    # The approval-only listener must never consume a normal @ message's ID.
+    if getattr(args, "approval_only", False) and (
+        not is_approval_confirmation(str(event.get("content", "")), args) or not load_pending_approvals(args)
+    ):
+        return
+    key = runtime_event_key(event, args)
+    with lock:
+        if event_key_for_dedupe(event) in seen or args._runtime_store.get_job(key) is not None:
+            return
+        try:
+            scheduler.submit(key, runtime_scope(args, event), runtime_route(args), authorization_snapshot(args), event)
+        except RuntimeError:
+            # During shutdown, flush already-read events to the inbox without
+            # starting them. The next process revalidates their policy.
+            args._runtime_store.enqueue(key, runtime_scope(args, event), runtime_route(args), authorization_snapshot(args), event)
+
+
+def runtime_database_path(args: argparse.Namespace) -> Path:
+    return Path(args.runtime_db).expanduser() if args.runtime_db else Path(args.state_file).expanduser().with_suffix(".sqlite3")
+
+
+def runtime_status(args: argparse.Namespace) -> dict[str, Any]:
+    path = runtime_database_path(args).resolve()
+    if not path.exists():
+        return {"database": str(path), "exists": False}
+    # Status must not acquire the service lock, migrate, or recover live rows.
+    with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as connection:
+        result: dict[str, Any] = {"database": str(path), "exists": True}
+        for table in ("jobs", "steps", "outbox"):
+            result[table] = dict(connection.execute(f"SELECT status,COUNT(*) FROM {table} GROUP BY status"))
+        result["attention_jobs"] = [row[0] for row in connection.execute("SELECT id FROM jobs WHERE status IN ('failed','blocked') ORDER BY id")]
+    return result
 
 
 def wait_until_ready(process: subprocess.Popen[str], ready: threading.Event, timeout: float) -> None:
@@ -2800,16 +3040,18 @@ def code_ack_message(classification: ClassificationResult) -> str:
     return default_reply_for_type(classification.type) or "收到，这条需要进入 Codex 评审，我先评估改动面。"
 
 
-def approval_request_message(reply: str, args: argparse.Namespace) -> str:
+def approval_request_message(reply: str, args: argparse.Namespace, approval_id: str = "") -> str:
     reply = reply.strip() or "这条看起来需要进入代码修改阶段。我会先按当前信息整理最小改动方案。"
     phrase_text = " / ".join(str(item).strip() for item in (getattr(args, "approval_phrase", ()) or DEFAULT_APPROVAL_PHRASES) if str(item).strip())
     suffix = (
         f"如果同意我实际修改代码，请在群里回复：{phrase_text}。"
         "未确认前我只做只读探查，不会改文件；确认后也不会自动提交、推送或发布。"
     )
-    if "未确认前" in reply or "实际修改代码" in reply:
-        return reply
-    return reply.rstrip() + "\n\n" + suffix
+    if "未确认前" not in reply and "实际修改代码" not in reply:
+        reply = reply.rstrip() + "\n\n" + suffix
+    if approval_id and approval_id not in reply:
+        reply += f"\n审批任务：{approval_id}；可回复“确认 {approval_id}”。"
+    return reply
 
 
 def handle_approval_confirmation(
@@ -2822,9 +3064,12 @@ def handle_approval_confirmation(
     content = str(event.get("content", "") or "")
     if not approval_required(args) or not is_approval_confirmation(content, args):
         return False
-    pending = load_pending_approval(args)
-    if not pending:
+    all_pending = load_pending_approvals(args)
+    if not all_pending:
         return False
+    selected_ids = set(re.findall(r"dws-codex-[0-9a-f]{20}", content.lower()))
+    selected_id = next(iter(selected_ids)) if len(selected_ids) == 1 else ""
+    pending = all_pending.get(selected_id, {}) if selected_ids else load_pending_approval(args)
 
     record = {
         "event_id": event.get("event_id", ""),
@@ -2846,31 +3091,66 @@ def handle_approval_confirmation(
         seen.add(key)
         return True
 
-    if pending_approval_expired(pending, args):
-        clear_pending_approval(args)
+    if not pending or len(selected_ids) > 1:
+        reply = "请指定一条审批任务，回复“确认 任务编号”：\n" + "\n".join(sorted(all_pending))
+        if args.send:
+            send_reply(event, target, reply, args, purpose="approval_select")
+        log_json({"action": "code_approval_selection_required", **record, "reply": reply})
+        append_seen(args.state_file, key, "code_approval_selection_required")
+        seen.add(key)
+        return True
+
+    snapshot = pending.get("authorization")
+    policy_changed = snapshot is not None and snapshot != authorization_snapshot(args)
+    legacy_scope_changed = snapshot is None and (
+        (pending.get("repo") and pending.get("repo") != primary_repo(args))
+        or (pending.get("project") and pending.get("project") != args.project)
+        or (pending.get("conversation_id") and pending.get("conversation_id") != event.get("conversation_id"))
+    )
+    if policy_changed or legacy_scope_changed:
+        reply = "这条任务的授权配置已经变化，请重新描述需求并审批；本次不会执行代码。"
+        if args.send:
+            send_reply(event, target, reply, args, purpose="approval_policy_changed")
+        log_json({"action": "code_approval_policy_changed", **record})
+        append_seen(args.state_file, key, "code_approval_policy_changed")
+        seen.add(key)
+        return True
+
+    approved_step_id = runtime_scope(args, event) + ":approved:" + str(pending["approval_id"])
+    store = getattr(args, "_runtime_store", None)
+    existing_step = store.get_step(approved_step_id) if store is not None else None
+    if pending_approval_expired(pending, args) and existing_step is None:
         reply = "这条代码修改审批已经过期了。请重新 @我 描述要处理的问题，我会重新给方案并等待确认。"
         send_result: dict[str, Any] = {}
         if args.send:
             send_result = send_reply(event, target, reply, args, purpose="approval_expired")
+        clear_pending_approval(args, str(pending["approval_id"]))
         log_json({"action": "code_approval_expired", **record, "reply": reply, "send_result": send_result})
         append_seen(args.state_file, key, "code_approval_expired")
         seen.add(key)
         return True
 
     ack_result: dict[str, Any] = {}
+    # Delivery identity belongs to the approved task, not to each subsequent OK.
+    delivery_event = {"event_id": "approval:" + str(pending["approval_id"]),
+                      "message_id": str(pending["approval_id"])}
     if args.send:
         ack_result = send_reply(
-            event,
+            delivery_event,
             target,
             "收到 owner 确认。我会在独立分支/工作树里开发和验证；不会提交、推送或发布。",
             args,
             purpose="approval_ack",
         )
-    bridge_result = run_approved_code_change(pending, event, args)
-    clear_pending_approval(args)
+    result_payload = checkpoint(
+        args, approved_step_id, "approved-code",
+        lambda: run_approved_code_change(pending, event, args).to_dict(),
+    )
+    bridge_result = CodexBridgeResult(**result_payload)
     delivery_result: dict[str, Any] = {}
     if args.send and bridge_result.delivery_message:
-        delivery_result = send_reply(event, target, bridge_result.delivery_message, args, purpose="approval_delivery")
+        delivery_result = send_reply(delivery_event, target, bridge_result.delivery_message, args, purpose="approval_delivery")
+    clear_pending_approval(args, str(pending["approval_id"]))
     log_json({
         "action": "code_approval_executed",
         **record,
@@ -2942,12 +3222,13 @@ def process_event(event: dict[str, Any], seen: set[str], args: argparse.Namespac
 
     history_context: list[dict[str, str]] = []
     if history_enabled(args):
-        history_context = fetch_history_context(event, args)
+        history_context = event_checkpoint(event, args, "history", lambda: fetch_history_context(event, args))
         if history_context:
             event = dict(event)
             event["_history_context"] = history_context
 
-    classification = classify_feedback(event, args)
+    classification_payload = event_checkpoint(event, args, "classification", lambda: classify_feedback(event, args).to_dict())
+    classification = ClassificationResult(**classification_payload)
     record = {
         "event_id": event.get("event_id", ""),
         "message_id": event.get("message_id", ""),
@@ -2973,14 +3254,16 @@ def process_event(event: dict[str, Any], seen: set[str], args: argparse.Namespac
         return
 
     if getattr(args, "reply_engine", "ai") == "codex":
-        try:
-            reply, session_result = generate_codex_session_reply(event, classification, args)
-        except Exception as e:
-            reply = "我这边 Codex 只读会话暂时没跑通，先保留这条消息，稍后继续确认。"
-            session_result = {"error": str(e)}
-            print(f"ERROR: codex session reply failed: {e}", file=sys.stderr)
+        def draft_session() -> tuple[str, dict[str, Any]]:
+            try:
+                return generate_codex_session_reply(event, classification, args)
+            except Exception as e:
+                print(f"ERROR: codex session reply failed: {e}", file=sys.stderr)
+                return "我这边 Codex 只读会话暂时没跑通，先保留这条消息，稍后继续确认。", {"error": str(e)}
+        reply, session_result = event_checkpoint(event, args, "codex-session", draft_session)
         if classification.needs_code and approval_required(args):
-            reply = approval_request_message(reply, args)
+            approval_id = task_id_for_event(event, classification)
+            reply = approval_request_message(reply, args, approval_id)
             pending = save_pending_approval(event, classification, args, reply)
             record["reply"] = reply
             record["codex_session"] = session_result
@@ -2995,8 +3278,9 @@ def process_event(event: dict[str, Any], seen: set[str], args: argparse.Namespac
                 ack_result: dict[str, Any] = {}
                 if args.send:
                     ack_result = send_reply(event, target, ack, args, purpose="proactive_ack")
-                bridge_result = run_codex_bridge(event, classification, args)
-                followup = proactive_delivery_message(bridge_result.delivery_message, args)
+                bridge_result = CodexBridgeResult(**event_checkpoint(
+                    event, args, "codex-review", lambda: run_codex_bridge(event, classification, args).to_dict()))
+                followup = approval_request_message(proactive_delivery_message(bridge_result.delivery_message, args), args, approval_id)
                 if followup:
                     pending = save_pending_approval(event, classification, args, followup)
                 followup_result: dict[str, Any] = {}
@@ -3043,6 +3327,16 @@ def process_event(event: dict[str, Any], seen: set[str], args: argparse.Namespac
 
     if classification.needs_code:
         ack = code_ack_message(classification)
+        if approval_required(args):
+            reply = approval_request_message(ack, args, task_id_for_event(event, classification))
+            pending = save_pending_approval(event, classification, args, reply)
+            send_result = send_reply(event, target, reply, args, purpose="approval_request") if args.send else {}
+            log_json({"action": "code_approval_requested" if args.send else "code_approval_requested_draft", **record,
+                      "reply": reply, "send_result": send_result,
+                      "pending_approval": {"approval_id": pending["approval_id"], "path": str(pending_approval_path(args))}})
+            append_seen(args.state_file, key, "code_approval_requested")
+            seen.add(key)
+            return
         if mode == "draft":
             log_json({"action": "codex_draft", **record, "reply": ack, "codex_prompt": build_codex_prompt(event, classification, args)})
             append_seen(args.state_file, key, "codex_drafted")
@@ -3052,7 +3346,8 @@ def process_event(event: dict[str, Any], seen: set[str], args: argparse.Namespac
         send_result: dict[str, Any] = {}
         if args.send:
             send_result = send_reply(event, target, ack, args, purpose="ack")
-        bridge_result = run_codex_bridge(event, classification, args)
+        bridge_result = CodexBridgeResult(**event_checkpoint(
+            event, args, "codex-bridge", lambda: run_codex_bridge(event, classification, args).to_dict()))
         delivery_result: dict[str, Any] = {}
         if args.send and bridge_result.delivery_message:
             delivery_result = send_reply(event, target, bridge_result.delivery_message, args, purpose="delivery")
@@ -3068,7 +3363,7 @@ def process_event(event: dict[str, Any], seen: set[str], args: argparse.Namespac
         seen.add(key)
         return
 
-    reply = generate_dialogue_reply(event, classification, args)
+    reply = event_checkpoint(event, args, "dialogue", lambda: generate_dialogue_reply(event, classification, args))
     record["reply"] = reply
     if not args.send:
         log_json({"action": "draft", **record})
@@ -3084,6 +3379,33 @@ def process_event(event: dict[str, Any], seen: set[str], args: argparse.Namespac
 
 def run(args: argparse.Namespace) -> int:
     args.state_file = Path(args.state_file).expanduser()
+    if args.runtime_status:
+        log_json(runtime_status(args))
+        return 0
+    if args.config_check:
+        return run_config(args)
+    runtime = load_runtime_module()
+    database = runtime_database_path(args)
+    with runtime.ProcessLock(str(database) + ".lock"), runtime.Store(database) as store:
+        args._runtime_store = store
+        scheduler = runtime.Scheduler(store, max_workers=args.max_workers, on_error=lambda job, exc: log_json({
+            "action": "runtime_attention_required", "job_id": job.id,
+            "error_type": type(exc).__name__, "error": str(exc),
+        }))
+        args._runtime_scheduler = scheduler
+        log_json({"action": "runtime_opened", "database": str(database), "max_workers": args.max_workers})
+        drain = False
+        try:
+            result = run_worker(args)
+            drain = result == 0 and not getattr(args, "_shutdown_requested", False)
+            return result
+        finally:
+            # If launchd kills a long-running child, the persisted started/sending
+            # guard still prevents replay on the next process.
+            scheduler.stop(wait=True, drain=drain)
+
+
+def run_worker(args: argparse.Namespace) -> int:
     if args.config:
         return run_config(args)
     if args.event_key not in RECEIVE_EVENTS:
@@ -3095,6 +3417,8 @@ def run(args: argparse.Namespace) -> int:
         )
 
     seen = load_seen(args.state_file)
+    intake_lock = threading.Lock()
+    register_runtime_handler(args, seen)
     cmd = build_consume_command(args)
     if args.print_command:
         log_json({"action": "consume_command", "command": cmd})
@@ -3109,8 +3433,12 @@ def run(args: argparse.Namespace) -> int:
     )
     ready = threading.Event()
     start_stderr_pump(process, ready)
+    stopping = threading.Event()
 
     def stop_child(signum: int, _frame: Any) -> None:
+        args._shutdown_requested = True
+        stopping.set()
+        args._runtime_scheduler.stop(wait=False, drain=False)
         if process.poll() is None:
             process.terminate()
 
@@ -3118,7 +3446,11 @@ def run(args: argparse.Namespace) -> int:
     previous_sigint = signal.signal(signal.SIGINT, stop_child)
     try:
         wait_until_ready(process, ready, args.ready_timeout)
-        send_ready_message(args)
+        notify_ready(args)
+        if stopping.is_set():
+            return 0
+        args._runtime_scheduler.start()
+        log_json({"action": "runtime_ready", "listeners": 1, "max_workers": args.max_workers})
         assert process.stdout is not None
         for line in process.stdout:
             line = line.strip()
@@ -3130,7 +3462,7 @@ def run(args: argparse.Namespace) -> int:
                 print(f"WARN: skip invalid event JSON: {e}", file=sys.stderr)
                 continue
             try:
-                process_event(event, seen, args)
+                dispatch_event(event, seen, args, intake_lock)
             except Exception as e:  # keep worker alive across bad events
                 print(f"ERROR: process event failed: {e}", file=sys.stderr)
         return process.wait()
@@ -3226,7 +3558,14 @@ def run_config(args: argparse.Namespace) -> int:
     if args.config_check:
         return 0
 
+    for consumer in consumers:
+        register_runtime_handler(consumer.args, seen)
+    stopping = threading.Event()
+
     def stop_children(_signum: int, _frame: Any) -> None:
+        args._shutdown_requested = True
+        stopping.set()
+        args._runtime_scheduler.stop(wait=False, drain=False)
         terminate_consumers(consumers)
 
     previous_sigterm = signal.signal(signal.SIGTERM, stop_children)
@@ -3235,9 +3574,13 @@ def run_config(args: argparse.Namespace) -> int:
         for consumer in consumers:
             wait_until_ready(consumer.process, consumer.ready, args.ready_timeout)
         for consumer in consumers:
-            send_ready_message(consumer.args)
+            notify_ready(consumer.args)
+        if stopping.is_set():
+            return 0
+        args._runtime_scheduler.start()
         for consumer in consumers:
             consumer.stdout_thread = start_stdout_pump(consumer, seen, seen_lock)
+        log_json({"action": "runtime_ready", "listeners": len(consumers), "max_workers": args.max_workers})
 
         while True:
             all_done = True
@@ -3266,7 +3609,7 @@ def run_config(args: argparse.Namespace) -> int:
                     pass
         for consumer in consumers:
             if consumer.stdout_thread is not None:
-                consumer.stdout_thread.join(timeout=1)
+                consumer.stdout_thread.join()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3314,11 +3657,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--admit-conversation", action="append", default=[],
                         help="allow one conversation to be processed; repeat or comma-separate")
     parser.add_argument("--state-file", default=str(default_state_file()), help="dedupe state jsonl")
-    parser.add_argument(
-        "--dws-bin",
-        default=os.getenv("DINGDING_ME_AGENT_DWS_BIN", os.getenv("DWS_BIN", "dws")),
-        help="dws executable",
-    )
+    parser.add_argument("--runtime-db", default="", help="SQLite inbox/checkpoint/outbox; defaults beside --state-file")
+    parser.add_argument("--runtime-status", action="store_true", help="read runtime counts without starting listeners or changing state")
+    parser.add_argument("--max-workers", type=int, default=3, help="maximum concurrent conversations (each conversation stays serial)")
+    parser.add_argument("--dws-bin", default=os.getenv("DINGDING_ME_AGENT_DWS_BIN", os.getenv("DWS_BIN", "dws")), help="dws executable")
     parser.add_argument("--dws-timeout", type=float, default=60.0, help="seconds for dws send calls")
     parser.add_argument("--ready-timeout", type=float, default=60.0, help="seconds to wait for event ready")
     parser.add_argument("--history-context", action="store_true",
@@ -3377,6 +3719,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
+    if args.max_workers < 1 or args.max_workers > 32:
+        raise ValueError("--max-workers must be between 1 and 32")
     args.allow_conversation = parse_csv_values(args.allow_conversation)
     args.allow_sender = parse_csv_values(args.allow_sender)
     args.admit_conversation = parse_csv_values(args.admit_conversation)
