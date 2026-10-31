@@ -10,6 +10,16 @@ import unittest
 from dingding_me_agent import config_tui as tui
 
 class AutoReplyConfigTuiTest(unittest.TestCase):
+    def setUp(self):
+        fixture = tempfile.TemporaryDirectory()
+        self.addCleanup(fixture.cleanup)
+        self.skill_path = pathlib.Path(fixture.name) / "laoxing" / "SKILL.md"
+        self.skill_path.parent.mkdir()
+        self.skill_path.write_text(
+            "---\nname: laoxing\n---\n# Test reply skill\nReply concisely and verify facts.\n",
+            encoding="utf-8",
+        )
+
     def sample_doc(self):
         return {
             "defaults": {
@@ -17,6 +27,7 @@ class AutoReplyConfigTuiTest(unittest.TestCase):
                 "send": True,
                 "reply_engine": "codex",
                 "reply_skill": "laoxing",
+                "reply_skill_path": str(self.skill_path),
                 "codex_audit_session_dir": "/tmp/audit",
                 "codex_execute": False,
             },
